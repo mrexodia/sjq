@@ -246,7 +246,8 @@ def main():
                 job_data = json.load(f)
 
         # Create and enqueue job using redis config from config file
-        create_job(redis, args.topic, job_data, args.parent_job_id)
+        job_id = create_job(redis, args.topic, job_data, args.parent_job_id)
+        print(f"Created job: {job_id}")
     elif args.command == "unlock":
         topics = enumerate_topics(args.topics)
         unlock_topics(redis, topics)
