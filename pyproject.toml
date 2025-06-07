@@ -1,0 +1,19 @@
+[project]
+name = "sjq"
+version = "0.1.0"
+description = "Simple job queue based on Redis."
+readme = "README.md"
+authors = [
+    { name = "Duncan Ogilvie", email = "mr.exodia.tpodt@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "redis>=6.2.0",
+]
+
+[project.scripts]
+sjq = "sjq.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
