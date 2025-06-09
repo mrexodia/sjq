@@ -3,9 +3,9 @@ import json
 import argparse
 from typing import TypeAlias, Callable
 
-Result: TypeAlias = dict | str | bool | None | int | float | list
+JsonData: TypeAlias = dict | str | bool | None | int | float | list
 
-JobFunc: TypeAlias = Callable[[dict], tuple[Result, str] | Result]
+JobFunc: TypeAlias = Callable[[dict], tuple[JsonData, str] | JsonData]
 MainFunc: TypeAlias = Callable[[], None]
 
 # @job decorator function to create a main function that handles the job
@@ -31,13 +31,12 @@ def job(func: JobFunc) -> MainFunc:
             data, next_topic = result
             output = {
                 "next_topic": next_topic,
-                "data": data
+                "data": data,
             }
         else:
-            data = result
             output = {
                 "next_topic": None,
-                "data": data
+                "data": result,
             }
 
         # Write output file

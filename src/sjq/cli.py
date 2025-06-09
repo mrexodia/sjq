@@ -54,10 +54,12 @@ def process_job(redis: Redis, job_id: str, topic: str):
 
     # Execute topic handler
     topic_script = f"topics/{topic}.py"
+    if not os.path.exists(topic_script):
+        raise FileNotFoundError(f"Topic script not found: {topic_script}")
     output_file = f"job_data/{job_id}-output.json"
     print(f"Running job: {job_id}")
     process = subprocess.run(
-        ["uv", "run", topic_script, "--input", input_file, "--output", output_file],
+        [sys.executable, topic_script, "--input", input_file, "--output", output_file],
         capture_output=True,
         text=True
     )
