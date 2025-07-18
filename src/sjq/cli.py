@@ -5,7 +5,7 @@ import time
 import argparse
 import subprocess
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TypedDict, Optional
 from redis import Redis
 from glob import glob
@@ -18,23 +18,23 @@ class JobMessage(TypedDict):
 def create_job(redis: Redis, topic: str, job_data: dict, parent_job_id: Optional[str] = None) -> str:
     """Creates a job and returns a unique job_id."""
 
-    # Create a unique job ID from the current time
     while True:
-        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S.%fZ")
+        # Create a unique job ID from the current time
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         job_id = f"{timestamp}-{topic}"
-        if redis.get(f"job_data:{job_id}") is None:
-            break
-        time.sleep(0.002)
-
-    job_message: JobMessage = {
-        "job_id": job_id,
-        "parent_job_id": parent_job_id,
-        "data": job_data,
-    }
-    redis.set(f"job_data:{job_id}", json.dumps(job_message)) # Store job data
-    redis.rpush(f"incoming:{topic}", job_id) # Add to tail (right) of incoming queue
-
-    return job_id
+        
+        # Try to atomically set the job data key only if it does not exist
+        job_message: JobMessage = {
+            "job_id": job_id,
+            "parent_job_id": parent_job_id,
+            "data": job_data,
+        }
+        if redis.set(f"job_data:{job_id}", json.dumps(job_message), nx=True):
+            redis.rpush(f"incoming:{topic}", job_id)  # Add to tail (right) of incoming queue
+            return job_id
+        
+        # Sleep for a short time before trying again
+        time.sleep(0.000001)
 
 def process_job(redis: Redis, job_id: str, topic: str):
     # Get job data from Redis
