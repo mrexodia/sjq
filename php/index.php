@@ -14,7 +14,7 @@ function create_job($redis, $topic, $job_data)
     while (true) {
         // Create a unique job ID from the current time
         $timestamp = (new DateTime("now", new DateTimeZone("UTC")))->format("Ymd\THis.u\Z");
-        $job_id    = "{$timestamp}-{$topic}";
+        $job_id    = "{$timestamp}:{$topic}";
 
         // Try to atomically set the job data key only if it does not exist
         $job_message = [

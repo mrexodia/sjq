@@ -67,7 +67,7 @@ async function createJob(topic, data) {
       .toISOString()
       .replace(/[-:]/g, "")
       .replace(/\.(\d{3})Z$/, ".$1000Z");
-    const job_id = `${timestamp}-${topic}`;
+    const job_id = `${timestamp}:${topic}`;
 
     // Try to atomically set the job data key only if it does not exist
     const setnx = await redis(
@@ -81,7 +81,6 @@ async function createJob(topic, data) {
     if (setnx) {
       // Add to tail (right) of incoming queue
       const rpush = await redis("RPUSH", `incoming:${topic}`, job_id);
-      console.log(`rpush:${rpush}`);
       return job_id;
     }
 
@@ -109,8 +108,8 @@ export default {
 
     // Extract the topic
     const url = new URL(request.url);
-    const topic = url.searchParams.get("topic");
-    if (topic === null || topic === "") {
+    const topic = url.pathname.replaceAll("/", ":").substring(1);
+    if (!topic) {
       return new Response("Missing topic", {
         status: 400,
       });
@@ -119,9 +118,7 @@ export default {
     // Get the data from the request body
     let data;
     const contentType = request.headers.get("Content-Type");
-    if (contentType && contentType.startsWith("text/plain")) {
-      data = await request.text();
-    } else {
+    if (contentType === "application/json") {
       try {
         data = await request.json();
       } catch (error) {
@@ -129,7 +126,17 @@ export default {
           status: 400,
         });
       }
+    } else {
+      data = await request.text();
     }
+
+    // Log all valid requests
+    console.log(
+      JSON.stringify({
+        topic,
+        data,
+      })
+    );
 
     // Create the job
     try {

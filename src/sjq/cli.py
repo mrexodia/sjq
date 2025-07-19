@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -21,7 +22,7 @@ def create_job(redis: Redis, topic: str, job_data: dict, parent_job_id: Optional
     while True:
         # Create a unique job ID from the current time
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        job_id = f"{timestamp}-{topic}"
+        job_id = f"{timestamp}:{topic}"
         
         # Try to atomically set the job data key only if it does not exist
         job_message: JobMessage = {
@@ -48,7 +49,8 @@ def process_job(redis: Redis, job_id: str, topic: str):
     start_time = datetime.now()
 
     # Write input data to file
-    input_file = f"job_data/{job_id}-input.json"
+    job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
+    input_file = f"job_data/{job_id_safe}-input.json"
     with open(input_file, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -56,7 +58,7 @@ def process_job(redis: Redis, job_id: str, topic: str):
     topic_script = f"topics/{topic}.py"
     if not os.path.exists(topic_script):
         raise FileNotFoundError(f"Topic script not found: {topic_script}")
-    output_file = f"job_data/{job_id}-output.json"
+    output_file = f"job_data/{job_id_safe}-output.json"
     print(f"Running job: {job_id}")
     process = subprocess.run(
         [sys.executable, topic_script, "--input", input_file, "--output", output_file],
@@ -78,7 +80,7 @@ def process_job(redis: Redis, job_id: str, topic: str):
         "stdout": process.stdout,
         "stderr": process.stderr,
     }
-    with open(f"job_data/{job_id}-metadata.json", "w") as f:
+    with open(f"job_data/{job_id_safe}-metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     if process.returncode != 0:
