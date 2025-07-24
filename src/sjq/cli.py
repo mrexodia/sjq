@@ -4,64 +4,96 @@ import sys
 import json
 import time
 import argparse
+import traceback
 import subprocess
 
 from datetime import datetime, timezone
-from typing import TypedDict, Optional
+from typing import TypedDict, Optional, NotRequired
 from redis import Redis
 from glob import glob
 
 class JobMessage(TypedDict):
     job_id: str
-    parent_job_id: Optional[str]
+    parent_job_id: NotRequired[str]
     data: dict
+    attachment: NotRequired[bool]
 
-def create_job(redis: Redis, topic: str, job_data: dict, parent_job_id: Optional[str] = None) -> str:
+def create_job(redis: Redis, topic: str, job_data: dict, attachment: Optional[str], parent_job_id: Optional[str] = None) -> str:
     """Creates a job and returns a unique job_id."""
 
     while True:
         # Create a unique job ID from the current time
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         job_id = f"{timestamp}:{topic}"
-        
+        has_attachment = attachment and os.path.exists(attachment)
+
         # Try to atomically set the job data key only if it does not exist
         job_message: JobMessage = {
             "job_id": job_id,
             "parent_job_id": parent_job_id,
             "data": job_data,
         }
+        if has_attachment:
+            job_message["attachment"] = True
+
         if redis.set(f"job_data:{job_id}", json.dumps(job_message), nx=True):
-            redis.rpush(f"incoming:{topic}", job_id)  # Add to tail (right) of incoming queue
+            # Store attachment if provided
+            if has_attachment:
+                with open(attachment, "rb") as f:
+                    attachment_data = f.read()
+                redis.set(f"job_attachment:{job_id}", attachment_data)
+
+            # Add to tail (right) of incoming queue
+            redis.rpush(f"incoming:{topic}", job_id)
             return job_id
-        
+
         # Sleep for a short time before trying again
         time.sleep(0.000001)
 
 def process_job(redis: Redis, job_id: str, topic: str):
+    # Filename safe job id
+    job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
+
     # Get job data from Redis
     job_data = redis.get(f"job_data:{job_id}")
     if job_data is None:
-        raise ValueError(f"No data found for job {job_id}")
+        raise KeyError(f"No data found for job {job_id}")
 
-    job_message: JobMessage = json.loads(job_data)
+    job_message: JobMessage = json.loads(job_data.decode("utf-8"))
     data = job_message["data"]
     parent_job_id = job_message.get("parent_job_id")
-    start_time = datetime.now()
+
+    # Write attachment to file if it exists
+    if job_message.get("attachment"):
+        attachment_data = redis.get(f"job_attachment:{job_id}")
+        if attachment_data is None:
+            raise KeyError(f"No attachment found for job {job_id}")
+        attachment_file = f"job_data/{job_id_safe}-attachment.bin"
+        with open(attachment_file, "wb") as f:
+            f.write(attachment_data)
+    else:
+        attachment_file = None
 
     # Write input data to file
-    job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
     input_file = f"job_data/{job_id_safe}-input.json"
     with open(input_file, "w") as f:
         json.dump(data, f, indent=2)
 
     # Execute topic handler
+    start_time = datetime.now()
     topic_script = f"topics/{topic}.py"
     if not os.path.exists(topic_script):
         raise FileNotFoundError(f"Topic script not found: {topic_script}")
     output_file = f"job_data/{job_id_safe}-output.json"
     print(f"Running job: {job_id}")
+
+    # Build command arguments
+    cmd_args = [sys.executable, topic_script, "--input", input_file, "--output", output_file]
+    if attachment_file:
+        cmd_args.append("--attachment")
+        cmd_args.append(attachment_file)
     process = subprocess.run(
-        [sys.executable, topic_script, "--input", input_file, "--output", output_file],
+        cmd_args,
         capture_output=True,
         text=True
     )
@@ -84,15 +116,15 @@ def process_job(redis: Redis, job_id: str, topic: str):
         json.dump(metadata, f, indent=2)
 
     if process.returncode != 0:
-        raise ValueError(f"Job {job_id} failed with exit code {process.returncode}")
+        raise ChildProcessError(f"Job {job_id} failed with exit code {process.returncode}")
 
     print(f"Successful job: {job_id} ({elapsed_time:.2f} seconds)")
 
     # Process output and enqueue next job if needed
     with open(output_file, "r") as f:
         output = json.load(f)
-    next_topic = output.get("next_topic")
-    if next_topic:
+    next_topics = output.get("next_topics", [])
+    for next_topic in next_topics:
         next_job_id = create_job(redis, next_topic, output["data"], job_id)
         print(f"Created next job: {job_id} -> {next_job_id}")
 
@@ -113,6 +145,7 @@ def process_topic(redis: Redis, topic: str):
     )
     if job_id is None:
         return
+    job_id = job_id.decode("utf-8")
 
     try:
         process_job(redis, job_id, topic)
@@ -124,10 +157,18 @@ def process_topic(redis: Redis, topic: str):
             job_id
         )
         redis.delete(f"job_data:{job_id}")
+        # Clean up attachment if it exists
+        redis.delete(f"job_binary:{job_id}")
     except Exception as e:
-        print(f"Error processing job: {e}")
+        traceback.print_exc()
+        if isinstance(e, KeyError):
+            error_queue = "fatal"
+            print(f"Job integrity error (fatal): {e}")
+        else:
+            error_queue = "failed"
+            print(f"Job processing error: {e}")
         # Add the job to the failed queue and remove it from processing
-        redis.rpush(f"failed:{topic}", job_id)
+        redis.rpush(f"{error_queue}:{topic}", job_id)
         redis.lrem(
             f"processing:{topic}",
             -1, # tail -> head (remove from the right)
@@ -140,6 +181,7 @@ def lock_topics(redis: Redis, topics: list[str]):
     for topic in topics:
         value = redis.set(f"lock:{topic}", os.getpid(), nx=True, get=True)
         if value is not None:
+            value = value.decode("utf-8")
             print(f"Failed to acquire lock for topic: {topic} (pid={value})")
             success = False
     if not success:
@@ -151,24 +193,26 @@ def unlock_topics(redis: Redis, topics: list[str]):
     for topic in topics:
         redis.delete(f"lock:{topic}")
 
+def move_queue(redis: Redis, src: str, dst: str):
+    count = redis.llen(src)
+    for _ in range(count):
+        # Move entries in front of the destination queue
+        entry: bytes = redis.lmove(
+            src,
+            dst,
+            src="RIGHT", # tail
+            dest="LEFT", # head
+        )
+        if entry is None:
+            break
+        yield entry
+
 def recover_topics(redis: Redis, topics: list[str]):
     """Recover processing jobs from the given topics."""
     for topic in topics:
-        count = redis.llen(f"processing:{topic}")
-        if count == 0:
-            continue
-        print(f"Recovering {count} jobs from topic: {topic}")
-        for _ in range(count):
-            # Move the failed jobs in front of the processing queue
-            job_id = redis.lmove(
-                f"processing:{topic}",
-                f"incoming:{topic}",
-                src="RIGHT", # tail
-                dest="LEFT", # head
-            )
-            if job_id is None:
-                break
-            print(f"  {job_id}")
+        print(f"Recovering jobs from topic: {topic}")
+        for job_id in move_queue(redis, f"processing:{topic}", f"incoming:{topic}"):
+            print(f"  {job_id.decode('utf-8')}")
 
 def process_topics(redis: Redis, topics: list[str]):
     """Process jobs from the given topics."""
@@ -184,6 +228,13 @@ def process_topics(redis: Redis, topics: list[str]):
         print("Exiting...")
     finally:
         unlock_topics(redis, topics)
+
+def retry_topics(redis: Redis, topics: list[str]):
+    """Retry failed jobs from the given topics."""
+    for topic in topics:
+        print(f"Retrying jobs from topic: {topic}")
+        for job_id in move_queue(redis, f"failed:{topic}", f"incoming:{topic}"):
+            print(f"  {job_id.decode('utf-8')}")
 
 def enumerate_topics(filter: list[str]) -> list[str]:
     topics = []
@@ -212,7 +263,6 @@ def main():
     redis = Redis(
         **config["redis"],
         socket_timeout=30,
-        decode_responses=True
     )
     if not redis.ping():
         print("Redis connection failed")
@@ -229,12 +279,17 @@ def main():
     # Create subcommand
     create_parser = command_parser.add_parser("create", help="Create a new job")
     create_parser.add_argument("topic", help="Topic to send job to")
-    create_parser.add_argument("input", help="Input JSON file or JSON string")
+    create_parser.add_argument("input", help="Input JSON file, JSON string or attachment file")
+    create_parser.add_argument("attachment", help="Attachment file path (optional)", nargs="?", default=None)
     create_parser.add_argument("--parent-job-id", help="Parent job ID if this is a child job", required=False)
 
     # Unlock subcommand
     unlock_parser = command_parser.add_parser("unlock", help="Unlock topics")
     unlock_parser.add_argument("topics", nargs="*", help="Topics to unlock (defaults to all in this workspace)")
+
+    # Retry subcommand
+    retry_parser = command_parser.add_parser("retry", help="Retry failed jobs")
+    retry_parser.add_argument("topics", nargs="*", help="Topics to retry (defaults to all in this workspace)")
 
     # Parse arguments
     args = main_parser.parse_args()
@@ -242,16 +297,27 @@ def main():
         topics = enumerate_topics(args.topics)
         process_topics(redis, topics)
     elif args.command == "create":
-        # Try to parse as JSON string first, then as file path
-        try:
-            job_data = json.loads(args.input)
-        except json.JSONDecodeError:
-            with open(args.input, "r") as f:
-                job_data = json.load(f)
+        if os.path.exists(args.input):
+            _, extension = os.path.splitext(args.input)
+            if extension == ".json":
+                with open(args.input, "r") as f:
+                    job_data = json.load(f)
+            else:
+                job_data = {}
+                args.attachment = args.input
+        else:
+            try:
+                job_data = json.loads(args.input)
+            except json.JSONDecodeError:
+                print(f"Input is not a valid JSON string or file path: {args.input}")
+                sys.exit(1)
 
         # Create and enqueue job using redis config from config file
-        job_id = create_job(redis, args.topic, job_data, args.parent_job_id)
+        job_id = create_job(redis, args.topic, job_data, args.attachment, args.parent_job_id)
         print(f"Created job: {job_id}")
     elif args.command == "unlock":
         topics = enumerate_topics(args.topics)
         unlock_topics(redis, topics)
+    elif args.command == "retry":
+        topics = enumerate_topics(args.topics)
+        retry_topics(redis, topics)

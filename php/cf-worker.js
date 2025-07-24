@@ -1,4 +1,13 @@
 // Documentation: https://workers.cloudflare.com
+const PUSHOVER_TOKEN = "<PUSHOVER_TOKEN>";
+const PUSHOVER_USER = "<PUSHOVER_USER>";
+const WEBDIS_ENDPOINT = "https://webdis.example.com";
+const WEBDIS_HEADERS = {
+  Authorization: `Basic ${btoa("default:password")}`,
+  "CF-Access-Client-Id": "<CF_ACCESS_CLIENT_ID>",
+  "CF-Access-Client-Secret": "<CF_ACCESS_CLIENT_SECRET>",
+};
+const AUTH_BEARER_TOKEN = "<AUTH_BEARER_TOKEN>";
 
 async function sendNotification(message) {
   try {
@@ -9,8 +18,8 @@ async function sendNotification(message) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        token: "<PUSHOVER_TOKEN>",
-        user: "<PUSHOVER_USER>",
+        token: PUSHOVER_TOKEN,
+        user: PUSHOVER_USER,
         message: message,
         priority: 0,
       }),
@@ -33,12 +42,10 @@ async function redis(command, ...args) {
     path += encodeURIComponent(args[i]);
   }
   let body = args[args.length - 1];
-  // https://github.com/nicolasff/webdis
-  const response = await fetch(`https://<WEBDIS_URL>/${path}`, {
+  // https://webd.is/
+  const response = await fetch(`${WEBDIS_ENDPOINT}/${path}`, {
     method: "PUT",
-    headers: {
-      Authorization: `Basic ${btoa("<WEBDIS_USER>:<WEBDIS_PASSWORD>")}`,
-    },
+    headers: WEBDIS_HEADERS,
     body,
   });
   if (!response.ok) {
@@ -60,13 +67,17 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function createJob(topic, data) {
+function getTimestamp() {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.(\d{3})Z$/, ".$1000Z");
+}
+
+async function createJob(topic, data, attachment) {
   while (true) {
     // Create a unique job ID from the current time
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[-:]/g, "")
-      .replace(/\.(\d{3})Z$/, ".$1000Z");
+    const timestamp = getTimestamp();
     const job_id = `${timestamp}:${topic}`;
 
     // Try to atomically set the job data key only if it does not exist
@@ -76,9 +87,14 @@ async function createJob(topic, data) {
       JSON.stringify({
         job_id,
         data,
+        attachment: attachment ? true : false,
       })
     );
     if (setnx) {
+      if (attachment) {
+        await redis("SET", `job_attachment:${job_id}`, attachment);
+      }
+
       // Add to tail (right) of incoming queue
       const rpush = await redis("RPUSH", `incoming:${topic}`, job_id);
       return job_id;
@@ -99,7 +115,7 @@ export default {
 
     // Check authorization
     const authHeader = request.headers.get("Authorization");
-    const expectedAuth = "Bearer <WORKER_AUTH_TOKEN>";
+    const expectedAuth = `Bearer ${AUTH_BEARER_TOKEN}`;
     if (authHeader !== expectedAuth) {
       return new Response("Unauthorized", {
         status: 403,
@@ -117,6 +133,7 @@ export default {
 
     // Get the data from the request body
     let data;
+    let attachment = null;
     const contentType = request.headers.get("Content-Type");
     if (contentType === "application/json") {
       try {
@@ -127,7 +144,17 @@ export default {
         });
       }
     } else {
-      data = await request.text();
+      const buffer = await request.arrayBuffer();
+      const decoder = new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: false,
+      });
+      try {
+        data = decoder.decode(buffer);
+      } catch (error) {
+        attachment = buffer;
+        data = Object.fromEntries(url.searchParams);
+      }
     }
 
     // Log all valid requests
@@ -140,7 +167,7 @@ export default {
 
     // Create the job
     try {
-      const job_id = await createJob(topic, data);
+      const job_id = await createJob(topic, data, attachment);
       return new Response(job_id);
     } catch (error) {
       const time = new Date().toISOString();
