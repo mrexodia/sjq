@@ -6,11 +6,13 @@ from typing import TypeAlias, Callable, Optional
 
 JsonData: TypeAlias = dict | str | bool | None | int | float | list
 
-JobFunc: TypeAlias = Callable[[dict, Optional[str]], tuple[JsonData, list[str]] | tuple[JsonData, str] | JsonData]
+JobFuncResult: TypeAlias = tuple[JsonData, list[str]] | tuple[JsonData, str] | JsonData
+JobFuncSimple: TypeAlias = Callable[[dict], JobFuncResult]
+JobFuncAttachment: TypeAlias = Callable[[dict, Optional[str]], JobFuncResult]
 MainFunc: TypeAlias = Callable[[], None]
 
 # @job decorator function to create a main function that handles the job
-def job(func: JobFunc) -> MainFunc:
+def job(func: JobFuncSimple | JobFuncAttachment) -> MainFunc:
     def job_main() -> None:
         # Parse the --input and --output arguments
         parser = argparse.ArgumentParser(description="Process a job for this topic")
@@ -30,9 +32,9 @@ def job(func: JobFunc) -> MainFunc:
         # Process the data
         signature = inspect.signature(func)
         if len(signature.parameters) == 2:
-            result = func(input_data, args.attachment)
+            result: JobFuncResult = func(input_data, args.attachment) # type: ignore
         else:
-            result = func(input_data)
+            result: JobFuncResult = func(input_data) # type: ignore
         if isinstance(result, tuple):
             data, next_topics = result
             if isinstance(next_topics, str):

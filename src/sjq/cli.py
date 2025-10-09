@@ -25,21 +25,22 @@ def create_job(redis: Redis, topic: str, job_data: dict, attachment: Optional[st
         # Create a unique job ID from the current time
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         job_id = f"{timestamp}:{topic}"
-        has_attachment = attachment and os.path.exists(attachment)
+        has_attachment = attachment is not None and os.path.exists(attachment)
 
         # Try to atomically set the job data key only if it does not exist
         job_message: JobMessage = {
             "job_id": job_id,
-            "parent_job_id": parent_job_id,
             "data": job_data,
         }
+        if parent_job_id is not None:
+            job_message["parent_job_id"] = parent_job_id
         if has_attachment:
             job_message["attachment"] = True
 
         if redis.set(f"job_data:{job_id}", json.dumps(job_message), nx=True):
             # Store attachment if provided
             if has_attachment:
-                with open(attachment, "rb") as f:
+                with open(attachment, "rb") as f: # type: ignore (attachment is always valid path here)
                     attachment_data = f.read()
                 redis.set(f"job_attachment:{job_id}", attachment_data)
 
@@ -55,7 +56,7 @@ def process_job(redis: Redis, job_id: str, topic: str):
     job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
 
     # Get job data from Redis
-    job_data = redis.get(f"job_data:{job_id}")
+    job_data: Optional[bytes] = redis.get(f"job_data:{job_id}") # type: ignore (redis sdk bug)
     if job_data is None:
         raise KeyError(f"No data found for job {job_id}")
 
@@ -65,7 +66,7 @@ def process_job(redis: Redis, job_id: str, topic: str):
 
     # Write attachment to file if it exists
     if job_message.get("attachment"):
-        attachment_data = redis.get(f"job_attachment:{job_id}")
+        attachment_data: Optional[bytes] = redis.get(f"job_attachment:{job_id}") # type: ignore (redis sdk bug)
         if attachment_data is None:
             raise KeyError(f"No attachment found for job {job_id}")
         attachment_file = f"job_data/{job_id_safe}-attachment.bin"
@@ -136,16 +137,16 @@ def process_topic(redis: Redis, topic: str):
     # Without timeout Ctrl+C will not work
     # https://github.com/redis/redis-py/issues/1305#issuecomment-597305775
 
-    job_id = redis.blmove(
+    job_id_bytes: Optional[bytes] = redis.blmove(
         f"incoming:{topic}",
         f"processing:{topic}",
         src="LEFT", # head
         dest="RIGHT", # tail
         timeout=1,
-    )
-    if job_id is None:
+    ) # type: ignore (redis sdk bug)
+    if job_id_bytes is None:
         return
-    job_id = job_id.decode("utf-8")
+    job_id = job_id_bytes.decode("utf-8")
 
     try:
         process_job(redis, job_id, topic)
@@ -179,10 +180,9 @@ def lock_topics(redis: Redis, topics: list[str]):
     """Acquire locks for the given topics."""
     success = True
     for topic in topics:
-        value = redis.set(f"lock:{topic}", os.getpid(), nx=True, get=True)
+        value: Optional[bytes] = redis.set(f"lock:{topic}", os.getpid(), nx=True, get=True) # type: ignore (redis sdk bug)
         if value is not None:
-            value = value.decode("utf-8")
-            print(f"Failed to acquire lock for topic: {topic} (pid={value})")
+            print(f"Failed to acquire lock for topic: {topic} (pid={value.decode('utf-8')})")
             success = False
     if not success:
         sys.exit(1)
@@ -194,15 +194,15 @@ def unlock_topics(redis: Redis, topics: list[str]):
         redis.delete(f"lock:{topic}")
 
 def move_queue(redis: Redis, src: str, dst: str):
-    count = redis.llen(src)
+    count: int = redis.llen(src) # type: ignore (redis sdk bug)
     for _ in range(count):
         # Move entries in front of the destination queue
-        entry: bytes = redis.lmove(
+        entry: Optional[bytes] = redis.lmove(
             src,
             dst,
             src="RIGHT", # tail
             dest="LEFT", # head
-        )
+        ) # type: ignore (redis sdk bug)
         if entry is None:
             break
         yield entry
