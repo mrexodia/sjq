@@ -18,6 +18,19 @@ class JobMessage(TypedDict):
     data: dict
     attachment: NotRequired[bool]
 
+class JobMetadata(TypedDict):
+    job_id: str
+    parent_job_id: Optional[str]
+    topic: str
+    start_time: str
+    end_time: str
+    elapsed_time: float
+    exit_code: int
+    stdout: str
+    stderr: str
+    command: str
+    args: list[str]
+
 def create_job(redis: Redis, topic: str, job_data: dict, attachment: Optional[str], parent_job_id: Optional[str] = None) -> str:
     """Creates a job and returns a unique job_id."""
 
@@ -51,7 +64,7 @@ def create_job(redis: Redis, topic: str, job_data: dict, attachment: Optional[st
         # Sleep for a short time before trying again
         time.sleep(0.000001)
 
-def process_job(redis: Redis, job_id: str, topic: str):
+def process_job(redis: Redis, job_id: str, topic: str, *, create_next_job=True):
     # Filename safe job id
     job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
 
@@ -102,7 +115,7 @@ def process_job(redis: Redis, job_id: str, topic: str):
     # Create metadata
     now = datetime.now()
     elapsed_time = (now - start_time).total_seconds()
-    metadata = {
+    metadata: JobMetadata = {
         "job_id": job_id,
         "parent_job_id": parent_job_id,
         "topic": topic,
@@ -112,6 +125,8 @@ def process_job(redis: Redis, job_id: str, topic: str):
         "exit_code": process.returncode,
         "stdout": process.stdout,
         "stderr": process.stderr,
+        "command": cmd_args[0],
+        "args": cmd_args[1:],
     }
     with open(f"job_data/{job_id_safe}-metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -126,10 +141,15 @@ def process_job(redis: Redis, job_id: str, topic: str):
         output = json.load(f)
     next_topics = output.get("next_topics", [])
     for next_topic in next_topics:
-        next_job_id = create_job(redis, next_topic, output["data"], job_id)
-        print(f"Created next job: {job_id} -> {next_job_id}")
+        if create_next_job:
+            next_job_id = create_job(redis, next_topic, output["data"], job_id)
+            print(f"Created next job: {job_id} -> {next_job_id}")
+        else:
+            print(f"Skipped creating next job: {job_id} -> {next_topic}")
 
-def process_topic(redis: Redis, topic: str):
+    return metadata
+
+def process_topic(redis: Redis, topic: str) -> bool:
     """Process jobs from the given topic."""
     # Implement a reliable FIFO queue by moving jobs from the head of the incoming
     # list to the tail of the processing list.
@@ -145,7 +165,7 @@ def process_topic(redis: Redis, topic: str):
         timeout=1,
     ) # type: ignore (redis sdk bug)
     if job_id_bytes is None:
-        return
+        return False
     job_id = job_id_bytes.decode("utf-8")
 
     try:
@@ -175,6 +195,7 @@ def process_topic(redis: Redis, topic: str):
             -1, # tail -> head (remove from the right)
             job_id
         )
+    return True
 
 def lock_topics(redis: Redis, topics: list[str]):
     """Acquire locks for the given topics."""
@@ -214,16 +235,20 @@ def recover_topics(redis: Redis, topics: list[str]):
         for job_id in move_queue(redis, f"processing:{topic}", f"incoming:{topic}"):
             print(f"  {job_id.decode('utf-8')}")
 
-def process_topics(redis: Redis, topics: list[str]):
+def process_topics(redis: Redis, topics: list[str], limit: Optional[int]):
     """Process jobs from the given topics."""
     lock_topics(redis, topics)
     recover_topics(redis, topics)
 
     print(f"Processing topics: {', '.join(topics)}")
     try:
+        count = 0
         while True:
             for topic in topics:
-                process_topic(redis, topic)
+                if limit is not None and count >= limit:
+                    return
+                if process_topic(redis, topic):
+                    count += 1
     except KeyboardInterrupt:
         print("Exiting...")
     finally:
@@ -275,6 +300,7 @@ def main():
     # Worker subcommand
     worker_parser = command_parser.add_parser("worker", help="Start worker process")
     worker_parser.add_argument("--topics", nargs="*", default=None, help="Topics to monitor (defaults to all in this workspace)")
+    worker_parser.add_argument("--limit", type=int, default=None, help="Total number of jobs to process (default to unlimited)")
 
     # Create subcommand
     create_parser = command_parser.add_parser("create", help="Create a new job")
@@ -291,33 +317,67 @@ def main():
     retry_parser = command_parser.add_parser("retry", help="Retry failed jobs")
     retry_parser.add_argument("topics", nargs="*", help="Topics to retry (defaults to all in this workspace)")
 
+    # Dev subcommand
+    dev_parser = command_parser.add_parser("dev", help="Development commands")
+    dev_parser.add_argument("topic", help="Topic to run the first job for (without creating follow-up jobs)")
+    dev_parser.add_argument("--index", type=int, default=0, help="Index of the job to run (default to the first job)")
+
     # Parse arguments
     args = main_parser.parse_args()
-    if args.command == "worker":
-        topics = enumerate_topics(args.topics)
-        process_topics(redis, topics)
-    elif args.command == "create":
-        if os.path.exists(args.input):
-            _, extension = os.path.splitext(args.input)
-            if extension == ".json":
-                with open(args.input, "r") as f:
-                    job_data = json.load(f)
+    match args.command:
+        case "worker":
+            topics = enumerate_topics(args.topics)
+            process_topics(redis, topics, args.limit)
+        case "create":
+            if os.path.exists(args.input):
+                _, extension = os.path.splitext(args.input)
+                if extension == ".json":
+                    with open(args.input, "r") as f:
+                        job_data = json.load(f)
+                else:
+                    job_data = {}
+                    args.attachment = args.input
             else:
-                job_data = {}
-                args.attachment = args.input
-        else:
-            try:
-                job_data = json.loads(args.input)
-            except json.JSONDecodeError:
-                print(f"Input is not a valid JSON string or file path: {args.input}")
-                sys.exit(1)
+                try:
+                    job_data = json.loads(args.input)
+                except json.JSONDecodeError:
+                    print(f"Input is not a valid JSON string or file path: {args.input}")
+                    sys.exit(1)
 
-        # Create and enqueue job using redis config from config file
-        job_id = create_job(redis, args.topic, job_data, args.attachment, args.parent_job_id)
-        print(f"Created job: {job_id}")
-    elif args.command == "unlock":
-        topics = enumerate_topics(args.topics)
-        unlock_topics(redis, topics)
-    elif args.command == "retry":
-        topics = enumerate_topics(args.topics)
-        retry_topics(redis, topics)
+            # Create and enqueue job using redis config from config file
+            job_id = create_job(redis, args.topic, job_data, args.attachment, args.parent_job_id)
+            print(f"Created job: {job_id}")
+        case "unlock":
+            topics = enumerate_topics(args.topics)
+            unlock_topics(redis, topics)
+        case "retry":
+            topics = enumerate_topics(args.topics)
+            retry_topics(redis, topics)
+        case "dev":
+            topic: str = args.topic
+            if topic not in enumerate_topics([]):
+                print(f"No topic handler found for topic: {topic}")
+                sys.exit(1)
+            try:
+                lock_topics(redis, [topic])
+                # Get the first job ID from the incoming queue
+                job_id_bytes: Optional[bytes] = redis.lindex(f"incoming:{topic}", args.index) # type: ignore (redis sdk bug)
+                if job_id_bytes is None:
+                    print(f"No jobs found in incoming queue for topic: {topic}")
+                    sys.exit(1)
+                job_id = job_id_bytes.decode("utf-8")
+                metadata = process_job(redis, job_id, topic)
+                print(f"[command]\nuv run {' '.join(metadata['args'])}")
+                print(f"[exit code]\n{metadata['exit_code']}")
+                print(f"[elapsed]\n{metadata['elapsed_time']}s")
+                stdout = metadata["stdout"]
+                stderr = metadata["stderr"]
+                if stdout:
+                    print(f"[stdout]\n{stdout}")
+                if stderr:
+                    print(f"[stderr]\n{stderr}")
+            finally:
+                unlock_topics(redis, [topic])
+        case unknown:
+            print(f"Unknown command: {unknown}")
+            sys.exit(1)

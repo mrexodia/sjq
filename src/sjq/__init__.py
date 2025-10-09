@@ -5,10 +5,9 @@ import argparse
 from typing import TypeAlias, Callable, Optional
 
 JsonData: TypeAlias = dict | str | bool | None | int | float | list
-
-JobFuncResult: TypeAlias = tuple[JsonData, list[str]] | tuple[JsonData, str] | JsonData
-JobFuncSimple: TypeAlias = Callable[[dict], JobFuncResult]
-JobFuncAttachment: TypeAlias = Callable[[dict, Optional[str]], JobFuncResult]
+JobResult: TypeAlias = tuple[JsonData, list[str]] | tuple[JsonData, str] | JsonData
+JobFuncSimple: TypeAlias = Callable[[dict], JobResult]
+JobFuncAttachment: TypeAlias = Callable[[dict, Optional[str]], JobResult]
 MainFunc: TypeAlias = Callable[[], None]
 
 # @job decorator function to create a main function that handles the job
@@ -32,9 +31,9 @@ def job(func: JobFuncSimple | JobFuncAttachment) -> MainFunc:
         # Process the data
         signature = inspect.signature(func)
         if len(signature.parameters) == 2:
-            result: JobFuncResult = func(input_data, args.attachment) # type: ignore
+            result: JobResult = func(input_data, args.attachment) # type: ignore
         else:
-            result: JobFuncResult = func(input_data) # type: ignore
+            result: JobResult = func(input_data) # type: ignore
         if isinstance(result, tuple):
             data, next_topics = result
             if isinstance(next_topics, str):
