@@ -64,9 +64,12 @@ def create_job(redis: Redis, topic: str, job_data: dict, attachment: Optional[st
         # Sleep for a short time before trying again
         time.sleep(0.000001)
 
-def process_job(redis: Redis, job_id: str, topic: str, *, create_next_job=True):
+def safe_job_id(job_id: str) -> str:
     # Filename safe job id
-    job_id_safe = re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
+    return re.sub(r"[^0-9a-zA-Z-_.]", "-", job_id)
+
+def process_job(redis: Redis, job_id: str, topic: str, *, create_next_job=True):
+    job_id_safe = safe_job_id(job_id)
 
     # Get job data from Redis
     job_data: Optional[bytes] = redis.get(f"job_data:{job_id}") # type: ignore (redis sdk bug)
@@ -146,8 +149,6 @@ def process_job(redis: Redis, job_id: str, topic: str, *, create_next_job=True):
             print(f"Created next job: {job_id} -> {next_job_id}")
         else:
             print(f"Skipped creating next job: {job_id} -> {next_topic}")
-
-    return metadata
 
 def process_topic(redis: Redis, topic: str) -> bool:
     """Process jobs from the given topic."""
@@ -366,7 +367,18 @@ def main():
                     print(f"No jobs found in incoming queue for topic: {topic}")
                     sys.exit(1)
                 job_id = job_id_bytes.decode("utf-8")
-                metadata = process_job(redis, job_id, topic)
+                status = 0
+                try:
+                    process_job(redis, job_id, topic)
+                except KeyError as e:
+                    print(e)
+                    sys.exit(1)
+                except Exception as e:
+                    print(e)
+                    status = 1
+                job_id_safe = safe_job_id(job_id)
+                with open(f"job_data/{job_id_safe}-metadata.json", "r") as f:
+                    metadata: JobMetadata = json.load(f)
                 print(f"[command]\nuv run {' '.join(metadata['args'])}")
                 print(f"[exit code]\n{metadata['exit_code']}")
                 print(f"[elapsed]\n{metadata['elapsed_time']}s")
@@ -376,6 +388,7 @@ def main():
                     print(f"[stdout]\n{stdout}")
                 if stderr:
                     print(f"[stderr]\n{stderr}")
+                sys.exit(status)
             finally:
                 unlock_topics(redis, [topic])
         case unknown:
