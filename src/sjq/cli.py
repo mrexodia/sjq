@@ -6,11 +6,16 @@ import time
 import argparse
 import traceback
 import subprocess
+import threading
 
 from datetime import datetime, timezone
 from typing import TypedDict, Optional, NotRequired
 from redis import Redis
 from glob import glob
+
+# Global variables for lock renewal
+_lock_renewal_thread: Optional[threading.Thread] = None
+_lock_renewal_stop_event: Optional[threading.Event] = None
 
 class JobMessage(TypedDict):
     job_id: str
@@ -198,19 +203,75 @@ def process_topic(redis: Redis, topic: str) -> bool:
         )
     return True
 
+def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
+    """Background thread function to renew locks every 10 seconds."""
+    while not stop_event.is_set():
+        # Wait for 10 seconds or until stop event is set
+        if stop_event.wait(10):
+            break
+
+        # Renew each lock with 15 second expiration
+        for topic in topics:
+            try:
+                # Only renew if the lock is still ours (check PID)
+                current_value: Optional[bytes] = redis.get(f"lock:{topic}") # type: ignore (redis sdk bug)
+                if current_value is not None and current_value.decode('utf-8') == str(os.getpid()):
+                    redis.set(f"lock:{topic}", os.getpid(), ex=15)
+            except Exception as e:
+                print(f"Failed to renew lock for topic {topic}: {e}")
+
 def lock_topics(redis: Redis, topics: list[str]):
-    """Acquire locks for the given topics."""
-    success = True
+    """Acquire locks for the given topics with expiration and retry logic."""
+    global _lock_renewal_thread, _lock_renewal_stop_event
+
+    # Try to acquire locks with retry logic (up to 20 seconds)
+    max_wait_time = 20
+    start_time = time.time()
+    locked_topics = []
+
     for topic in topics:
-        value: Optional[bytes] = redis.set(f"lock:{topic}", os.getpid(), nx=True, get=True) # type: ignore (redis sdk bug)
-        if value is not None:
-            print(f"Failed to acquire lock for topic: {topic} (pid={value.decode('utf-8')})")
-            success = False
-    if not success:
-        sys.exit(1)
+        while True:
+            # Try to acquire lock with 15 second expiration
+            value: Optional[bytes] = redis.set(f"lock:{topic}", os.getpid(), nx=True, ex=15, get=True) # type: ignore (redis sdk bug)
+
+            if value is None:
+                # Successfully acquired lock
+                locked_topics.append(topic)
+                break
+
+            # Lock is held by another process
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait_time:
+                print(f"Failed to acquire lock for topic: {topic} (pid={value.decode('utf-8')}) after {max_wait_time} seconds")
+                print("Another instance is likely running. Exiting.")
+                # Clean up any locks we acquired
+                for locked_topic in locked_topics:
+                    redis.delete(f"lock:{locked_topic}")
+                sys.exit(1)
+
+            # Wait a bit before retrying
+            time.sleep(1)
+
+    # Start lock renewal thread
+    _lock_renewal_stop_event = threading.Event()
+    _lock_renewal_thread = threading.Thread(
+        target=_renew_locks,
+        args=(redis, topics, _lock_renewal_stop_event),
+        daemon=True
+    )
+    _lock_renewal_thread.start()
+    print(f"Acquired locks for topics: {', '.join(topics)}")
 
 def unlock_topics(redis: Redis, topics: list[str]):
     """Release locks for the given topics."""
+    global _lock_renewal_thread, _lock_renewal_stop_event
+
+    # Stop the lock renewal thread
+    if _lock_renewal_stop_event is not None:
+        _lock_renewal_stop_event.set()
+    if _lock_renewal_thread is not None and _lock_renewal_thread.is_alive():
+        _lock_renewal_thread.join(timeout=2)
+
     print(f"Releasing locks for topics: {', '.join(topics)}")
     for topic in topics:
         redis.delete(f"lock:{topic}")
