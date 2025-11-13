@@ -226,9 +226,14 @@ def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
                 # Atomically check and renew the lock
                 result = redis.eval(renew_script, 1, f"lock:{topic}", str(os.getpid()), "15")
                 if result is None:
-                    print(f"Warning: Lost lock for topic {topic} (lock stolen or expired)")
+                    print(f"FATAL: Lost lock for topic {topic} (stolen or expired)")
+                    print("Another worker may have acquired the lock. Terminating immediately to prevent race conditions.")
+                    # Force exit the entire process to prevent processing with a stolen lock
+                    os._exit(1)
             except Exception as e:
-                print(f"Failed to renew lock for topic {topic}: {e}")
+                print(f"FATAL: Failed to renew lock for topic {topic}: {e}")
+                print("Cannot guarantee lock ownership. Terminating immediately to prevent race conditions.")
+                os._exit(1)
 
 def lock_topics(redis: Redis, topics: list[str]):
     """Acquire locks for the given topics with expiration and retry logic."""
