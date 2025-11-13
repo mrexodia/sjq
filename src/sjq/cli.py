@@ -205,6 +205,16 @@ def process_topic(redis: Redis, topic: str) -> bool:
 
 def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
     """Background thread function to renew locks every 10 seconds."""
+    # Lua script for atomic lock renewal
+    # Only renews if the lock value matches our PID
+    renew_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("set", KEYS[1], ARGV[1], "EX", ARGV[2])
+        else
+            return nil
+        end
+    """
+
     while not stop_event.is_set():
         # Wait for 10 seconds or until stop event is set
         if stop_event.wait(10):
@@ -213,10 +223,10 @@ def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
         # Renew each lock with 15 second expiration
         for topic in topics:
             try:
-                # Only renew if the lock is still ours (check PID)
-                current_value: Optional[bytes] = redis.get(f"lock:{topic}") # type: ignore (redis sdk bug)
-                if current_value is not None and current_value.decode('utf-8') == str(os.getpid()):
-                    redis.set(f"lock:{topic}", os.getpid(), ex=15)
+                # Atomically check and renew the lock
+                result = redis.eval(renew_script, 1, f"lock:{topic}", str(os.getpid()), "15")
+                if result is None:
+                    print(f"Warning: Lost lock for topic {topic} (lock stolen or expired)")
             except Exception as e:
                 print(f"Failed to renew lock for topic {topic}: {e}")
 
