@@ -38,7 +38,7 @@ The system consists of the following main components:
 ### Data Flow
 
 1.  A job is created using `sjq create <topic> <input_json_file_or_string>`. This places a job message on the `incoming:<topic>` Redis list and stores job data.
-2.  A `sjq worker` process monitors specified topics.
+2.  A `sjq worker` process monitors the topic.
 3.  When a job ID is retrieved from an `incoming:<topic>` list, it's moved to a `processing:<topic>` list.
 4.  The worker prepares an input file (`job_data/<job_id>-input.json`) for the topic handler.
 5.  The corresponding `topics/<topic_name>.py` script is executed.
@@ -65,19 +65,13 @@ your_project_root/
 
 ### Running Workers
 
-To process jobs, you run `sjq worker` in your project's root directory. This command starts a daemon process that listens for and processes jobs.
+To process jobs, you run `sjq worker <topic>` in your project's root directory. This command starts a daemon process that listens for and processes jobs for that topic.
 
 ```bash
-sjq worker
+sjq worker topic1
 ```
 
-You can specify which topics a worker should handle:
-
-```bash
-sjq worker --topics topic1 topic3
-```
-
-- Only one worker can listen per topic at any given time due to a locking mechanism.
+- Only one worker can listen to a topic at any given time due to a locking mechanism.
 - Workers for different topics do not need to run on the same machine. This allows you to run workers for resource-intensive topics (e.g., requiring GPUs or significant RAM) on appropriately equipped machines.
 
 ### Creating Jobs
@@ -101,9 +95,8 @@ In a production environment, you would typically trigger pipelines programmatica
 `sjq` provides a command-line interface for interacting with the job queue:
 
 - **`sjq create <topic> <input_file_or_json_string> [--parent-job-id <id>]`**: Creates a new job for the specified topic.
-- **`sjq worker [--topics <topic1> <topic2> ...]`**: Starts a worker process to monitor and process jobs from the specified topics (or all topics if none are specified).
-- **`sjq unlock [<topic1> <topic2> ...]`**: Releases locks for the specified topics (or all topics if none are specified). This is useful if a worker crashed and did not release its lock.
-- **`sjq retry [<topic1> <topic2> ...]`**: Moves all jobs from the _failed_ queue back into the _incoming_ queue.
+- **`sjq worker <topic>`**: Starts a worker process to monitor and process jobs from the specified topic.
+- **`sjq retry <topic>`**: Moves all jobs from the _failed_ queue back into the _incoming_ queue for the specified topic.
 - **`sjq dev <topic> [index]`**: Runs the job handler for `<topic>` at `index` (defaults to 1) without creating follow-up jobs.
 
 Configuration, such as Redis connection details, is managed via a `config.json` file in the root of the project using `sjq`.
