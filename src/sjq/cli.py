@@ -11,6 +11,7 @@ import threading
 from datetime import datetime, timezone
 from typing import TypedDict, Optional, NotRequired
 from redis import Redis
+from redis.exceptions import RedisError
 from glob import glob
 
 # Global variables for lock renewal
@@ -203,8 +204,8 @@ def process_topic(redis: Redis, topic: str) -> bool:
         )
     return True
 
-def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
-    """Background thread function to renew locks every 10 seconds."""
+def _renew_locks(redis: Redis, topic: str, stop_event: threading.Event):
+    """Background thread function to renew lock every 10 seconds."""
     # Lua script for atomic lock renewal
     # Only renews if the lock value matches our PID
     renew_script = """
@@ -220,65 +221,60 @@ def _renew_locks(redis: Redis, topics: list[str], stop_event: threading.Event):
         if stop_event.wait(10):
             break
 
-        # Renew each lock with 15 second expiration
-        for topic in topics:
-            try:
-                # Atomically check and renew the lock
-                result = redis.eval(renew_script, 1, f"lock:{topic}", str(os.getpid()), "15")
-                if result is None:
-                    print(f"FATAL: Lost lock for topic {topic} (stolen or expired)")
-                    print("Another worker may have acquired the lock. Terminating immediately to prevent race conditions.")
-                    # Force exit the entire process to prevent processing with a stolen lock
-                    os._exit(1)
-            except Exception as e:
-                print(f"FATAL: Failed to renew lock for topic {topic}: {e}")
-                print("Cannot guarantee lock ownership. Terminating immediately to prevent race conditions.")
+        # Renew lock with 15 second expiration
+        try:
+            # Atomically check and renew the lock
+            result = redis.eval(renew_script, 1, f"lock:{topic}", str(os.getpid()), "15")
+            if result is None:
+                print(f"FATAL: Lost lock for topic {topic} (stolen or expired)")
+                print("Another worker may have acquired the lock. Terminating immediately to prevent race conditions.")
+                # Force exit the entire process to prevent processing with a stolen lock
                 os._exit(1)
+        except RedisError as e:
+            print(f"FATAL: Failed to renew lock for topic {topic}: {e}")
+            print("Cannot guarantee lock ownership. Terminating immediately to prevent race conditions.")
+            os._exit(1)
 
-def lock_topics(redis: Redis, topics: list[str]):
-    """Acquire locks for the given topics with expiration and retry logic."""
+def lock_topic(redis: Redis, topic: str):
+    """Acquire lock for the given topic with expiration and retry logic."""
     global _lock_renewal_thread, _lock_renewal_stop_event
 
     # Try to acquire locks with retry logic (up to 20 seconds)
     max_wait_time = 20
     start_time = time.time()
-    locked_topics = []
 
-    for topic in topics:
-        while True:
-            # Try to acquire lock with 15 second expiration
-            value: Optional[bytes] = redis.set(f"lock:{topic}", os.getpid(), nx=True, ex=15, get=True) # type: ignore (redis sdk bug)
+    while True:
+        # Try to acquire lock with 15 second expiration
+        value: Optional[bytes] = redis.set(f"lock:{topic}", os.getpid(), nx=True, ex=15, get=True) # type: ignore (redis sdk bug)
 
-            if value is None:
-                # Successfully acquired lock
-                locked_topics.append(topic)
-                break
+        if value is None:
+            # Successfully acquired lock
+            break
 
-            # Lock is held by another process
-            elapsed = time.time() - start_time
-            if elapsed >= max_wait_time:
-                print(f"Failed to acquire lock for topic: {topic} (pid={value.decode('utf-8')}) after {max_wait_time} seconds")
-                print("Another instance is likely running. Exiting.")
-                # Clean up any locks we acquired
-                for locked_topic in locked_topics:
-                    redis.delete(f"lock:{locked_topic}")
-                sys.exit(1)
+        print(f"Waiting to acquire lock for topic: {topic} (pid={value.decode('utf-8')})...")
 
-            # Wait a bit before retrying
-            time.sleep(1)
+        # Lock is held by another process
+        elapsed = time.time() - start_time
+        if elapsed >= max_wait_time:
+            print(f"Failed to acquire lock for topic: {topic} (pid={value.decode('utf-8')}) after {max_wait_time} seconds")
+            print("Another instance is likely running. Exiting.")
+            sys.exit(1)
+
+        # Wait a bit before retrying
+        time.sleep(5)
 
     # Start lock renewal thread
     _lock_renewal_stop_event = threading.Event()
     _lock_renewal_thread = threading.Thread(
         target=_renew_locks,
-        args=(redis, topics, _lock_renewal_stop_event),
+        args=(redis, topic, _lock_renewal_stop_event),
         daemon=True
     )
     _lock_renewal_thread.start()
-    print(f"Acquired locks for topics: {', '.join(topics)}")
+    print(f"Acquired lock for topic: {topic}")
 
-def unlock_topics(redis: Redis, topics: list[str]):
-    """Release locks for the given topics."""
+def unlock_topic(redis: Redis, topic: str):
+    """Release lock for the given topic."""
     global _lock_renewal_thread, _lock_renewal_stop_event
 
     # Stop the lock renewal thread
@@ -287,9 +283,8 @@ def unlock_topics(redis: Redis, topics: list[str]):
     if _lock_renewal_thread is not None and _lock_renewal_thread.is_alive():
         _lock_renewal_thread.join(timeout=2)
 
-    print(f"Releasing locks for topics: {', '.join(topics)}")
-    for topic in topics:
-        redis.delete(f"lock:{topic}")
+    print(f"Releasing lock for topic: {topic}")
+    redis.delete(f"lock:{topic}")
 
 def move_queue(redis: Redis, src: str, dst: str):
     count: int = redis.llen(src) # type: ignore (redis sdk bug)
@@ -305,52 +300,42 @@ def move_queue(redis: Redis, src: str, dst: str):
             break
         yield entry
 
-def recover_topics(redis: Redis, topics: list[str]):
-    """Recover processing jobs from the given topics."""
-    for topic in topics:
-        print(f"Recovering jobs from topic: {topic}")
-        for job_id in move_queue(redis, f"processing:{topic}", f"incoming:{topic}"):
-            print(f"  {job_id.decode('utf-8')}")
+def recover_topic(redis: Redis, topic: str):
+    """Recover processing jobs from the given topic."""
+    print(f"Recovering jobs from topic: {topic}")
+    for job_id in move_queue(redis, f"processing:{topic}", f"incoming:{topic}"):
+        print(f"  {job_id.decode('utf-8')}")
 
-def process_topics(redis: Redis, topics: list[str], limit: Optional[int]):
-    """Process jobs from the given topics."""
-    lock_topics(redis, topics)
-    recover_topics(redis, topics)
+def process_topic_loop(redis: Redis, topic: str, limit: Optional[int]):
+    """Process jobs from the given topic."""
+    lock_topic(redis, topic)
+    recover_topic(redis, topic)
 
-    print(f"Processing topics: {', '.join(topics)}")
+    print(f"Processing topic: {topic}")
     try:
         count = 0
         while True:
-            for topic in topics:
-                if limit is not None and count >= limit:
-                    return
-                if process_topic(redis, topic):
-                    count += 1
+            if limit is not None and count >= limit:
+                return
+            if process_topic(redis, topic):
+                count += 1
     except KeyboardInterrupt:
         print("Exiting...")
     finally:
-        unlock_topics(redis, topics)
+        unlock_topic(redis, topic)
 
-def retry_topics(redis: Redis, topics: list[str]):
-    """Retry failed jobs from the given topics."""
-    for topic in topics:
-        print(f"Retrying jobs from topic: {topic}")
-        for job_id in move_queue(redis, f"failed:{topic}", f"incoming:{topic}"):
-            print(f"  {job_id.decode('utf-8')}")
+def retry_topic(redis: Redis, topic: str):
+    """Retry failed jobs from the given topic."""
+    print(f"Retrying jobs from topic: {topic}")
+    for job_id in move_queue(redis, f"failed:{topic}", f"incoming:{topic}"):
+        print(f"  {job_id.decode('utf-8')}")
 
-def enumerate_topics(filter: list[str]) -> list[str]:
+def enumerate_topics() -> list[str]:
     topics = []
     for file in sorted(glob("*.py", root_dir="topics")):
         topic, _ = os.path.splitext(file)
         topics.append(topic)
-    if not filter:
-        return topics
-
-    for topic in filter:
-        if topic not in topics:
-            print(f"Topic {topic} not found")
-            sys.exit(1)
-    return filter
+    return topics
 
 def main():
     os.makedirs("job_data", exist_ok=True)
@@ -376,7 +361,7 @@ def main():
 
     # Worker subcommand
     worker_parser = command_parser.add_parser("worker", help="Start worker process")
-    worker_parser.add_argument("--topics", nargs="*", default=None, help="Topics to monitor (defaults to all in this workspace)")
+    worker_parser.add_argument("topic", help="Topic to monitor")
     worker_parser.add_argument("--limit", type=int, default=None, help="Total number of jobs to process (default to unlimited)")
 
     # Create subcommand
@@ -386,13 +371,9 @@ def main():
     create_parser.add_argument("attachment", help="Attachment file path (optional)", nargs="?", default=None)
     create_parser.add_argument("--parent-job-id", help="Parent job ID if this is a child job", required=False)
 
-    # Unlock subcommand
-    unlock_parser = command_parser.add_parser("unlock", help="Unlock topics")
-    unlock_parser.add_argument("topics", nargs="*", help="Topics to unlock (defaults to all in this workspace)")
-
     # Retry subcommand
     retry_parser = command_parser.add_parser("retry", help="Retry failed jobs")
-    retry_parser.add_argument("topics", nargs="*", help="Topics to retry (defaults to all in this workspace)")
+    retry_parser.add_argument("topic", help="Topic to retry")
 
     # Dev subcommand
     dev_parser = command_parser.add_parser("dev", help="Development commands")
@@ -403,8 +384,11 @@ def main():
     args = main_parser.parse_args()
     match args.command:
         case "worker":
-            topics = enumerate_topics(args.topics)
-            process_topics(redis, topics, args.limit)
+            topic = args.topic
+            if topic not in enumerate_topics():
+                print(f"Topic {topic} not found")
+                sys.exit(1)
+            process_topic_loop(redis, topic, args.limit)
         case "create":
             if os.path.exists(args.input):
                 _, extension = os.path.splitext(args.input)
@@ -424,19 +408,19 @@ def main():
             # Create and enqueue job using redis config from config file
             job_id = create_job(redis, args.topic, job_data, args.attachment, args.parent_job_id)
             print(f"Created job: {job_id}")
-        case "unlock":
-            topics = enumerate_topics(args.topics)
-            unlock_topics(redis, topics)
         case "retry":
-            topics = enumerate_topics(args.topics)
-            retry_topics(redis, topics)
+            topic = args.topic
+            if topic not in enumerate_topics():
+                print(f"Topic {topic} not found")
+                sys.exit(1)
+            retry_topic(redis, topic)
         case "dev":
             topic: str = args.topic
-            if topic not in enumerate_topics([]):
+            if topic not in enumerate_topics():
                 print(f"No topic handler found for topic: {topic}")
                 sys.exit(1)
             try:
-                lock_topics(redis, [topic])
+                lock_topic(redis, topic)
                 # Get the first job ID from the incoming queue
                 job_id_bytes: Optional[bytes] = redis.lindex(f"incoming:{topic}", args.index) # type: ignore (redis sdk bug)
                 if job_id_bytes is None:
@@ -466,7 +450,7 @@ def main():
                     print(f"[stderr]\n{stderr}")
                 sys.exit(status)
             finally:
-                unlock_topics(redis, [topic])
+                unlock_topic(redis, topic)
         case unknown:
             print(f"Unknown command: {unknown}")
             sys.exit(1)
