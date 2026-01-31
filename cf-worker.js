@@ -134,8 +134,29 @@ export default {
     // Get the data from the request body
     let data;
     let attachment = null;
-    const contentType = request.headers.get("Content-Type");
-    if (contentType === "application/json") {
+    const contentType = request.headers.get("Content-Type") || "";
+    if (contentType.startsWith("multipart/form-data")) {
+      const form = await request.formData();
+      data = {};
+
+      for (const [key, value] of form.entries()) {
+        if (value instanceof File) {
+          if (attachment) {
+            return new Response("Too many files; only one attachment supported", {
+              status: 400,
+            });
+          }
+          attachment = await value.arrayBuffer();
+        } else if (Object.prototype.hasOwnProperty.call(data, key)) {
+          if (!Array.isArray(data[key])) {
+            data[key] = [data[key]];
+          }
+          data[key].push(value);
+        } else {
+          data[key] = value;
+        }
+      }
+    } else if (contentType.startsWith("application/json")) {
       try {
         data = await request.json();
       } catch (error) {
@@ -143,6 +164,25 @@ export default {
           status: 400,
         });
       }
+    } else if (contentType.startsWith("application/x-www-form-urlencoded")) {
+      const bodyText = await request.text();
+      const params = new URLSearchParams(bodyText);
+      data = {};
+      for (const [key, value] of params.entries()) {
+        if (Object.prototype.hasOwnProperty.call(data, key)) {
+          if (!Array.isArray(data[key])) {
+            data[key] = [data[key]];
+          }
+          data[key].push(value);
+        } else {
+          data[key] = value;
+        }
+      }
+    } else if (contentType.startsWith("text/plain")) {
+      data = await request.text();
+    } else if (contentType.startsWith("application/octet-stream")) {
+      attachment = await request.arrayBuffer();
+      data = Object.fromEntries(url.searchParams);
     } else {
       const buffer = await request.arrayBuffer();
       const decoder = new TextDecoder("utf-8", {
@@ -171,9 +211,11 @@ export default {
       return new Response(job_id);
     } catch (error) {
       const time = new Date().toISOString();
+      console.error("Failed to create job", error);
       await sendNotification(
         `[${time}] topic=${topic}, body=${JSON.stringify(data)} error: ${error}`
       );
+      return new Response("Failed to create job", { status: 500 });
     }
   },
 };
